@@ -32,8 +32,8 @@ from audit_ingestion.workflow import (
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-BUILD_VERSION = "v06.3"
-DISPLAY_BUILD_VERSION = "V.06.3 Vision"
+BUILD_VERSION = "v06.4"
+DISPLAY_BUILD_VERSION = "V.06.4 Vision"
 
 st.set_page_config(
     page_title="Audit Ingestion v06",
@@ -135,6 +135,8 @@ def _question_input_spec(q, detail: str = ""):
         return {"kind": "period"}
     if cluster == "agreement_dependency":
         return {"kind": "select", "options": ["", "Agreement uploaded separately", "Not needed for this file", "Still missing — request from client"]}
+    if qt == "ocr_quality_review":
+        return {"kind": "select", "options": ["", "Vision extraction run — content confirmed", "Reviewed source image — extraction acceptable", "Document too poor quality — flagged for manual entry"]}
     if getattr(q, "audience", "reviewer") == "reviewer":
         return {"kind": "select", "options": ["", "No further action needed", "Disclosure required", "Additional testing required", "Tracked in workpapers"]}
     return {"kind": "text"}
@@ -837,6 +839,9 @@ for r in raw_results:
         if _is_rent_receipt_name(ev.source_file):
             row["family"] = "rent_receipt"
             row["audit_areas"] = "expenses, cash, leases"
+        # Collect all warning-severity flags for inline display on the summary row
+        _warn_flags = [f for f in (ev.flags or []) if getattr(f, "severity", "") == "warning"]
+        row["_warn_flags"] = _warn_flags
         summary_rows.append(row)
     except Exception:
         summary_rows.append({
@@ -858,9 +863,9 @@ _STATUS_ICON = {"SUCCESS": "✅", "PARTIAL": "⚠️", "FAILED": "❌"}
 _STATUS_BG   = {"SUCCESS": "#f0fdf4", "PARTIAL": "#fffbeb", "FAILED": "#fef2f2"}
 
 # Header row
-_hc = st.columns([0.3, 2.4, 0.8, 1.0, 1.0, 1.2, 1.4, 1.0, 0.8, 0.4])
+_hc = st.columns([0.3, 2.4, 0.8, 1.0, 1.0, 1.2, 1.4, 1.0, 1.6, 0.8, 0.4])
 for col, label in zip(_hc, ["", "File", "Status", "Family", "Readiness", "Resolution",
-                              "Audit Areas", "Confidence", "Questions", ""]):
+                              "Audit Areas", "Confidence", "Warnings", "Questions", ""]):
     col.markdown(f"**{label}**")
 
 # Track checkbox state
@@ -874,7 +879,7 @@ for row in summary_rows:
     bg     = _STATUS_BG.get(status, "#ffffff")
     icon   = _STATUS_ICON.get(status, "—")
 
-    _rc = st.columns([0.3, 2.4, 0.8, 1.0, 1.0, 1.2, 1.4, 1.0, 0.8, 0.4])
+    _rc = st.columns([0.3, 2.4, 0.8, 1.0, 1.0, 1.2, 1.4, 1.0, 1.6, 0.8, 0.4])
     with _rc[0]:
         checked = st.checkbox("", key=f"chk_{fname}",
                               value=(fname in st.session_state["retry_selected"]),
@@ -901,8 +906,34 @@ for row in summary_rows:
     _rc[5].markdown(f"<small>{row.get('resolution_history','—')}</small>", unsafe_allow_html=True)
     _rc[6].markdown(f"<small>{row.get('audit_areas','—')}</small>", unsafe_allow_html=True)
     _rc[7].markdown(f"<small>{row.get('confidence','—')}</small>", unsafe_allow_html=True)
-    _qc = row.get("q_count", 0)
+    # Warnings column — ALL warning-severity flags shown inline, answerable without opening the file
+    _wf = row.get("_warn_flags") or []
     with _rc[8]:
+        if _wf:
+            _warn_label = f"⚠️ {len(_wf)} warning{'s' if len(_wf) > 1 else ''}"
+            with st.expander(_warn_label, expanded=False):
+                for _wflag in _wf:
+                    _wtype = getattr(_wflag, "type", "")
+                    _wdesc = getattr(_wflag, "description", "")
+                    st.markdown(
+                        f"<small><b>{_wtype.replace('_',' ').title()}</b><br>{_wdesc}</small>",
+                        unsafe_allow_html=True,
+                    )
+                    st.divider()
+                _qc_w = row.get("q_count", 0)
+                if _qc_w:
+                    if st.button(
+                        f"Answer {_qc_w} open question{'s' if _qc_w > 1 else ''}",
+                        key=f"warn_q_{fname}",
+                        use_container_width=True,
+                    ):
+                        st.session_state["_summary_question_file"] = fname
+                        st.session_state["_summary_question_open"] = True
+                        st.rerun()
+        else:
+            st.markdown("<small>—</small>", unsafe_allow_html=True)
+    _qc = row.get("q_count", 0)
+    with _rc[9]:
         if _qc:
             if st.button(f"⚠️ {_qc} Q", key=f"summary_q_{fname}", help=f"Show open questions for {fname}"):
                 st.session_state["_summary_question_file"] = fname
@@ -910,7 +941,7 @@ for row in summary_rows:
                 st.rerun()
         else:
             st.markdown("<small>—</small>", unsafe_allow_html=True)
-    with _rc[9]:
+    with _rc[10]:
         if st.button("🗑", key=f"del_{fname}", help=f"Remove {fname} from results"):
             _new_results = [
                 r for r in st.session_state.get("v05_results", [])

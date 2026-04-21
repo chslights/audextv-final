@@ -8,7 +8,7 @@ from .financial_classifier import classify_financial_file, is_financial_file
 from .readiness import compute_readiness, apply_readiness
 from .providers import get_provider
 
-__version__ = "6.3.0"
+__version__ = "6.3.1"
 __all__ = [
     "ingest_one", "AuditEvidence", "IngestionResult", "ParsedDocument",
     "DocumentComponent", "AttachmentSummary", "SegmentationResult",

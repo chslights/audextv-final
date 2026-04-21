@@ -297,6 +297,18 @@ _FLAG_RULES: dict[str, dict] = {
             "Run vision extraction to capture handwritten content."
         ),
     },
+    # canonical AI emits ocr_quality as a flag type -- alias it so it
+    # participates in readiness blocking the same way as ocr_limitations.
+    "ocr_quality": {
+        "audience":       "reviewer",
+        "question_type":  "ocr_quality_review",
+        "blocking":       True,
+        "question_text":  (
+            "This document has OCR quality concerns -- handwritten or low-legibility "
+            "content may be incomplete or inaccurate. "
+            "Run vision extraction to improve accuracy, then confirm the result."
+        ),
+    },
 }
 
 # Financial file flag overrides — some flags are blocking for financial files
