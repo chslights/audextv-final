@@ -1748,16 +1748,20 @@ def _run_manual_vision(mode: str, pages=None):
                 vision_prompt=_vision_prompt_val,
             )
         if _vres.evidence:
+            # Bug A fix: replace the full evidence object so that flags, readiness,
+            # audit_overview, facts, claims, document_specific, confidence, and all
+            # extracted content are updated — not just the vision_* display fields.
             def _apply_vision(_ev):
-                _ev.vision_applied         = _vres.evidence.vision_applied
-                _ev.vision_mode_used       = _vres.evidence.vision_mode_used
-                _ev.vision_pages_used      = _vres.evidence.vision_pages_used
-                _ev.vision_page_texts      = _vres.evidence.vision_page_texts
-                _ev.vision_page_status     = _vres.evidence.vision_page_status
-                _ev.vision_text            = _vres.evidence.vision_text
-                _ev.vision_prompt          = _vres.evidence.vision_prompt
-                _ev.vision_error           = _vres.evidence.vision_error
-                _ev.vision_run_diagnostics = _vres.evidence.vision_run_diagnostics
+                _new = _vres.evidence
+                # Carry forward source_file and any upload-level metadata that the
+                # re-run won't regenerate (the temp file has a different path).
+                _new.source_file = _ev.source_file
+                # Replace every field on the existing object from the new evidence.
+                for _field in _new.model_fields:
+                    try:
+                        setattr(_ev, _field, getattr(_new, _field))
+                    except Exception:
+                        pass
             _update_evidence_in_session(selected, _apply_vision)
             st.success(
                 f"Vision complete. Pages processed: {_vres.evidence.vision_pages_used or 'none'}"
@@ -1890,15 +1894,19 @@ if ev.vision_applied:
     ])
     with _tab_std:
         _std_text = ev.raw_text or "(no standard text extracted)"
+        # Bug B fix: show full text; height scales with content up to a comfortable max
+        _std_height = min(600, max(200, len(_std_text) // 40))
         st.text_area("Standard extracted text",
-            value=_std_text[:8000] + ("..." if len(_std_text) > 8000 else ""),
-            height=300, key=f"std_text_{selected}", disabled=True)
+            value=_std_text,
+            height=_std_height, key=f"std_text_{selected}", disabled=True)
         st.caption(f"{len(_std_text):,} chars")
     with _tab_vis:
         if ev.vision_text:
+            # Bug B fix: show full vision text without truncation
+            _vis_height = min(600, max(200, len(ev.vision_text) // 40))
             st.text_area("Vision extracted text",
-                value=ev.vision_text[:8000] + ("..." if len(ev.vision_text) > 8000 else ""),
-                height=300, key=f"vis_text_{selected}", disabled=True)
+                value=ev.vision_text,
+                height=_vis_height, key=f"vis_text_{selected}", disabled=True)
             st.caption(f"{_vis_chars:,} chars")
         else:
             st.info("No vision text captured yet.")
@@ -1923,7 +1931,15 @@ if ev.vision_applied:
                 _label   = f"{_icon} Page {_pn} — {_pstatus.replace('_',' ')} ({_pchars:,} chars)"
                 if _ptext:
                     with st.expander(_label, expanded=False):
-                        st.text(_ptext[:800] + ("..." if _pchars > 800 else ""))
+                        # Bug B fix: show full page text, not just first 800 chars
+                        st.text_area(
+                            label="Page text",
+                            value=_ptext,
+                            height=min(400, max(100, len(_ptext) // 40)),
+                            key=f"ptext_{selected}_{_pn}",
+                            disabled=True,
+                            label_visibility="collapsed",
+                        )
                 else:
                     st.caption(_label)
         else:

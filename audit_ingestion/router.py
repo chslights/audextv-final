@@ -365,6 +365,50 @@ def ingest_one(
     # Compute evidence readiness and generate questions
     apply_readiness(evidence)
 
+    # Bug C fix: emit handwriting_detected / ocr_limitations flags so the
+    # summary row readiness logic (driven by _FLAG_RULES in readiness.py)
+    # can surface them — preventing a false green-ready on documents that
+    # have handwriting or weak OCR and haven't had vision run yet.
+    _existing_flag_types = {f.type for f in evidence.flags}
+    _meta = evidence.extraction_meta
+
+    # Handwriting signal: any page reported has_handwriting in page metadata
+    _hw_pages = [
+        pg.page_number for pg in parsed_doc.pages
+        if getattr(pg, "has_handwriting", False)
+    ]
+    if _hw_pages and "handwriting_detected" not in _existing_flag_types:
+        if not (evidence.vision_applied and evidence.vision_pages_used):
+            # Only block if vision hasn't already addressed it
+            evidence.flags.append(Flag(
+                type="handwriting_detected",
+                description=(
+                    f"Handwriting detected on page(s) {_hw_pages}. "
+                    "Standard OCR may have missed handwritten responses. "
+                    "Run vision extraction to capture full content."
+                ),
+                severity="warning",
+            ))
+            _existing_flag_types.add("handwriting_detected")
+
+    # OCR weakness signal: document has weak pages and vision has not been applied
+    _weak_count = getattr(_meta, "weak_pages_count", 0) or 0
+    if _weak_count > 0 and "ocr_limitations" not in _existing_flag_types:
+        if not (evidence.vision_applied and evidence.vision_pages_used):
+            evidence.flags.append(Flag(
+                type="ocr_limitations",
+                description=(
+                    f"{_weak_count} page(s) had limited OCR quality (low character count or "
+                    "image-only content). Extracted text may be incomplete. "
+                    "Run vision extraction to improve accuracy."
+                ),
+                severity="warning",
+            ))
+            _existing_flag_types.add("ocr_limitations")
+
+    # Re-run readiness now that the new flags are present
+    apply_readiness(evidence)
+
     score = _score(evidence)
     ai_unavailable = any(f.type in ("canonical_failed", "no_ai") for f in evidence.flags)
     has_text = (evidence.extraction_meta.total_chars or 0) >= 200

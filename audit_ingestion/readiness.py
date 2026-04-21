@@ -273,6 +273,30 @@ _FLAG_RULES: dict[str, dict] = {
     "approximate_quantity":         None,
     "no_entity_name":               None,
     "tb_balanced":                  None,
+
+    # Bug C fix: OCR quality and handwriting warnings now participate in
+    # readiness/summary logic so the summary row cannot show green-ready when
+    # handwriting is present or OCR quality is limited.
+    "ocr_limitations": {
+        "audience":       "reviewer",
+        "question_type":  "ocr_quality_review",
+        "blocking":       True,
+        "question_text":  (
+            "This document contains handwriting or has limited OCR quality. "
+            "The extracted content may be incomplete or inaccurate. "
+            "Run vision extraction to improve accuracy, then confirm the result."
+        ),
+    },
+    "handwriting_detected": {
+        "audience":       "reviewer",
+        "question_type":  "ocr_quality_review",
+        "blocking":       True,
+        "question_text":  (
+            "Handwriting was detected in this document. "
+            "Standard text extraction may have missed handwritten responses. "
+            "Run vision extraction to capture handwritten content."
+        ),
+    },
 }
 
 # Financial file flag overrides — some flags are blocking for financial files
