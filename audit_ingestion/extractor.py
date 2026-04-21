@@ -420,10 +420,14 @@ _ENTITY_HINTS  = [
     'foundation', 'trust', 'services', 'associates',
 ]
 _HIGH_RISK_FIELD_PATTERNS = [
-    ('amount',   _re.compile(r'\$[\d,\.]+|total|balance|payment|award', _re.I)),
-    ('date',     _re.compile(r'\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|effective|expires|due', _re.I)),
-    ('payee',    _re.compile(r'pay(?:able)?\s+to|vendor|grantor|donor|lessor', _re.I)),
-    ('term',     _re.compile(r'term|months?|years?|period|duration', _re.I)),
+    # amount: requires an actual dollar value like $1,234.56 — not bare keywords
+    ('amount',   _re.compile(r'\$[\d,]+(?:\.\d{1,2})?', _re.I)),
+    # date: requires an actual date format like 12/10/2019 or 2019-04-01
+    ('date',     _re.compile(r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', _re.I)),
+    # payee: requires explicit "payable to X" or "payee:" labeling
+    ('payee',    _re.compile(r'pay(?:able)?\s+to\s+\S|payee\s*:', _re.I)),
+    # term: requires a numeric duration like "72 months" or "3 years"
+    ('term',     _re.compile(r'\b\d+\s+(?:months?|years?)\b', _re.I)),
 ]
 
 
@@ -443,6 +447,30 @@ def _score_text(text: str) -> dict:
     }
 
 
+def _ocr_garble_rate(text: str) -> float:
+    """
+    Estimate what fraction of lines in *text* look like OCR garbage.
+    A line is garbled if it has fewer than 2 word-characters, consists only
+    of separator characters, or is less than 35 percent alphanumeric.
+    Returns a rate in [0, 1].
+    """
+    if not text or not text.strip():
+        return 0.0
+    lines = [l for l in text.splitlines() if l.strip()]
+    if not lines:
+        return 0.0
+    garbled = 0
+    for line in lines:
+        stripped = line.strip()
+        alnum = sum(c.isalnum() for c in stripped)
+        word_chars = len(_re.findall(r'\w', stripped))
+        if word_chars < 2:
+            garbled += 1
+        elif alnum / max(len(stripped), 1) < 0.35:
+            garbled += 1
+    return garbled / len(lines)
+
+
 def _compute_page_improvement_score(
     native_text: str,
     vision_text: str,
@@ -459,6 +487,24 @@ def _compute_page_improvement_score(
 
     reasons = []
     score   = 0.0
+
+    # --- OCR garble signal (handwritten docs where char delta is small) ---
+    native_garble = _ocr_garble_rate(native_text or "")
+    if native_garble >= 0.40:
+        score += 0.45
+        reasons.append(f"native OCR garble rate {native_garble:.0%}")
+    elif native_garble >= 0.20:
+        score += 0.25
+        reasons.append(f"native OCR garble rate {native_garble:.0%}")
+
+    # --- Annotation text signal: vision successfully read handwriting ---
+    annotation_count = len(_re.findall(r'\[annotation(?:\s+text)?\]', vision_text, _re.I))
+    if annotation_count >= 3:
+        score += 0.35
+        reasons.append(f"{annotation_count} handwriting annotation(s) captured by vision")
+    elif annotation_count >= 1:
+        score += 0.15
+        reasons.append(f"{annotation_count} handwriting annotation(s) captured by vision")
 
     # Char delta (raw length improvement)
     char_delta = vs["chars"] - ns["chars"]
@@ -502,8 +548,8 @@ def _compute_page_improvement_score(
         score += 0.20
         reasons.append(f"handwriting markers: {hw_delta}")
 
-    # Vision is worse
-    if vs["chars"] < ns["chars"] * 0.7 and ns["chars"] > 100:
+    # Vision is worse — but skip penalty when native is heavily garbled
+    if vs["chars"] < ns["chars"] * 0.7 and ns["chars"] > 100 and native_garble < 0.20:
         return 0.0, MERGE_KEEP_NATIVE, "vision shorter than native — keeping native"
 
     # Determine merge decision

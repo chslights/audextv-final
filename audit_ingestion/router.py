@@ -602,6 +602,33 @@ def ingest_one(
                         evidence.document_specific = evidence.document_specific or {}
                         evidence.document_specific["_vision_canonical_error"] = str(_ce)
 
+            # Fix: suppress pre-vision legibility flags that are stale after a
+            # successful vision pass.  The canonical AI emits incomplete_page_set
+            # and friends before vision runs; if vision came back clean those
+            # flags are no longer accurate and should not alarm reviewers.
+            _v_succeeded = set(_vision_result.get("pages_succeeded", []))
+            _v_attempted = set(_vision_result.get("pages_attempted", []) or _v_succeeded)
+            _v_failed    = set(_vision_result.get("pages_failed", []))
+            _v_coverage  = len(_v_succeeded) / max(len(_v_attempted), 1)
+            _STALE_LEGIBILITY_FLAGS = {
+                "incomplete_page_set",
+                "partial_extraction",
+                "partial_extraction_visibility",
+                "truncated_content",
+            }
+            if _v_coverage >= 0.80 and not _v_failed:
+                # Full (or near-full) success — drop all stale legibility flags
+                evidence.flags = [
+                    f for f in evidence.flags
+                    if f.type not in _STALE_LEGIBILITY_FLAGS
+                ]
+            elif _v_coverage >= 0.80:
+                # Partial success — only drop warning-level stale flags
+                evidence.flags = [
+                    f for f in evidence.flags
+                    if not (f.type in _STALE_LEGIBILITY_FLAGS and f.severity == "warning")
+                ]
+
             # Store all vision outputs and provenance (Items 2, 3, 10, 16, 22)
             evidence.vision_applied        = True
             evidence.vision_mode_used      = vision_mode
