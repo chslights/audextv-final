@@ -32,8 +32,8 @@ from audit_ingestion.workflow import (
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-BUILD_VERSION = "v06.1"
-DISPLAY_BUILD_VERSION = "V.06.1 Vision"
+BUILD_VERSION = "v06.2"
+DISPLAY_BUILD_VERSION = "V.06.2 Vision"
 
 st.set_page_config(
     page_title="Audit Ingestion v06",
@@ -79,6 +79,14 @@ st.markdown("""
 .flag-critical { background: #fef2f2; border-left: 3px solid #dc2626; padding: 8px 12px; margin: 4px 0; border-radius: 0 4px 4px 0; }
 .diag-row { font-size: 0.82rem; color: #374151; }
 .prov-quote { font-style: italic; color: #6b7280; font-size: 0.8rem; }
+/* Fix disabled text areas — Streamlit renders these with low-contrast grey text.
+   Force readable dark text in Standard Extraction, Vision Extraction, and Per-Page Status. */
+.stTextArea textarea[disabled],
+.stTextArea textarea:disabled {
+    color: #111827 !important;
+    -webkit-text-fill-color: #111827 !important;
+    opacity: 1 !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -584,7 +592,7 @@ with st.sidebar:
     st.caption(f"Build: `{DISPLAY_BUILD_VERSION}`")
 
     st.markdown("---")
-    st.markdown("### 📋 v05 Architecture")
+    st.markdown("### 📋 v06 Architecture")
     st.markdown("""
 1. **Page-aware extraction**
    pdfplumber → PyPDF2 → extractous → OCR → vision
@@ -1847,10 +1855,23 @@ if ev.vision_applied:
         )
         with st.expander("🔴 High-risk changes requiring confirmation", expanded=True):
             for _chg in ev.vision_changed_high_risk_fields:
-                st.markdown(
-                    f"**Page {_chg.get('page')} — {_chg.get('field_type','').upper()}:** "
-                    f"new values: `{', '.join(str(v) for v in _chg.get('new_values',[]))}`"
-                )
+                _field  = _chg.get('field_type', '').upper()
+                _page   = _chg.get('page')
+                _vals   = _chg.get('new_values', [])
+                _ctxs   = _chg.get('value_contexts', {})
+                st.markdown(f"**Page {_page} — {_field}:** vision found {len(_vals)} new value(s) not in standard extraction")
+                for _val in _vals:
+                    _ctx = _ctxs.get(_val, "")
+                    if _ctx:
+                        # Show the value and the surrounding document text so the
+                        # reviewer can see the field label / context it came from
+                        st.markdown(
+                            f"&nbsp;&nbsp;• `{_val}` — *{_ctx}*",
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.markdown(f"&nbsp;&nbsp;• `{_val}`", unsafe_allow_html=True)
+                st.divider()
             _conf_col1, _conf_col2 = st.columns(2)
             if _conf_col1.button("✅ Accept vision changes", key=f"accept_vision_{selected}", type="primary"):
                 def _accept_changes(_ev):

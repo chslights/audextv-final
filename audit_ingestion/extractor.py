@@ -548,6 +548,31 @@ def _extract_handwriting_from_vision(vision_text: str) -> tuple[bool, str, float
     return (hw_found or bool(hw_lines)), handwriting_text, confidence
 
 
+def _extract_match_context(text: str, pattern, match_value: str, context_chars: int = 80) -> str:
+    """
+    Return a short snippet of text surrounding the first occurrence of match_value,
+    so reviewers can see the label/field name adjacent to the extracted value.
+    Falls back to empty string if not found.
+    """
+    if not text:
+        return ""
+    # Search case-insensitively for the match value in the text
+    lower_text = text.lower()
+    lower_match = match_value.lower()
+    idx = lower_text.find(lower_match)
+    if idx == -1:
+        return ""
+    start = max(0, idx - context_chars)
+    end   = min(len(text), idx + len(match_value) + context_chars)
+    snippet = text[start:end].replace("\n", " ").strip()
+    # Prefix ellipsis if we clipped the start
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(text):
+        snippet = snippet + "…"
+    return snippet
+
+
 def _detect_high_risk_field_changes(
     native_text: str,
     vision_text: str,
@@ -556,6 +581,8 @@ def _detect_high_risk_field_changes(
     """
     Detect if vision changed values for high-risk fields (amounts, dates, payee names).
     Returns list of change records that need reviewer confirmation.
+    Each record now includes a context snippet showing the surrounding text so
+    reviewers can see what label or field the value belongs to.
     """
     changes = []
     for field_type, pattern in _HIGH_RISK_FIELD_PATTERNS:
@@ -563,10 +590,18 @@ def _detect_high_risk_field_changes(
         vision_matches = set(m.lower() for m in (pattern.findall(vision_text or "")))
         new_values = vision_matches - native_matches
         if new_values:
+            top_values = sorted(new_values)[:5]
+            # Build a context snippet for each new value from the vision text
+            value_contexts = {}
+            for val in top_values:
+                ctx = _extract_match_context(vision_text or "", pattern, val)
+                if ctx:
+                    value_contexts[val] = ctx
             changes.append({
-                "field_type":   field_type,
-                "page":         page_number,
-                "new_values":   sorted(new_values)[:5],
+                "field_type":        field_type,
+                "page":              page_number,
+                "new_values":        top_values,
+                "value_contexts":    value_contexts,
                 "requires_confirmation": True,
             })
     return changes
