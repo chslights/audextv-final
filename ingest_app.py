@@ -32,11 +32,11 @@ from audit_ingestion.workflow import (
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-BUILD_VERSION = "v05.1"
-DISPLAY_BUILD_VERSION = "V.05.34"
+BUILD_VERSION = "v06.1"
+DISPLAY_BUILD_VERSION = "V.06.1 Vision"
 
 st.set_page_config(
-    page_title="Audit Ingestion v05",
+    page_title="Audit Ingestion v06",
     page_icon="📋",
     layout="wide",
 )
