@@ -147,7 +147,7 @@ def test_build_version_in_ingest_app():
     app_path = os.path.join(os.path.dirname(__file__), "..", "ingest_app.py")
     with open(app_path) as f:
         src = f.read()
-    assert 'BUILD_VERSION = "v05.1"' in src
+    assert 'BUILD_VERSION = "v06.5"' in src
 
 
 def test_provider_build_constant():

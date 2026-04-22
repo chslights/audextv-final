@@ -48,7 +48,26 @@ logger = logging.getLogger(__name__)
 _AI_SEMAPHORE  = threading.Semaphore(2)
 _OCR_SEMAPHORE = threading.Semaphore(2)
 
-ROUTER_BUILD = "v05.0"
+ROUTER_BUILD = "v06.5.1"
+
+
+_AUTO_MISSING_FIELDS_FAMILIES = {
+    DocumentFamily.CONTRACT,
+    DocumentFamily.INVOICE,
+    DocumentFamily.PAYMENT,
+    DocumentFamily.BANK,
+    DocumentFamily.PAYROLL,
+    DocumentFamily.ACCOUNTING,
+    DocumentFamily.GRANT,
+    DocumentFamily.TAX_REG,
+    DocumentFamily.SCHEDULE,
+}
+
+
+def _should_auto_vision_for_missing_fields(evidence: AuditEvidence) -> bool:
+    """Only finance-like families should auto-vision for missing amounts/dates/ids."""
+    fam = getattr(evidence, 'family', None)
+    return fam in _AUTO_MISSING_FIELDS_FAMILIES
 
 
 def ingest_one(
@@ -406,6 +425,118 @@ def ingest_one(
             ))
             _existing_flag_types.add("ocr_limitations")
 
+    # ── v06.5: Auto-rescue for vision-fixable warnings ────────────────────
+    # When allow_rescue=True, attempt vision on pages that produced handwriting
+    # or OCR warnings BEFORE asking the user to review them. This implements
+    # the "Mode A" hybrid design: the user only sees warnings that vision
+    # couldn't fix, not fixable-first-pass issues.
+    #
+    # Behavior nuance (per review feedback): vision success is not automatic
+    # reviewer-trust. If vision runs and confidence is high across the
+    # targeted pages, the fixable flags are cleared. If vision runs but
+    # confidence stays weak, the flags are downgraded from "blocking warning"
+    # to an info-severity note so the reviewer still sees the context but
+    # readiness is no longer artificially stuck.
+    from .readiness import VISION_FIXABLE_FLAGS
+    _fixable_present = [f for f in evidence.flags if f.type in VISION_FIXABLE_FLAGS]
+    if allow_rescue and provider is not None and _fixable_present and not evidence.vision_applied:
+        # Identify affected pages: handwriting pages + weak pages.
+        _target_pages = set()
+        for pg in parsed_doc.pages:
+            if getattr(pg, "has_handwriting", False):
+                _target_pages.add(pg.page_number)
+            if getattr(pg, "is_weak", False):
+                _target_pages.add(pg.page_number)
+        _target_pages = sorted(_target_pages)
+
+        if _target_pages:
+            logger.info(
+                f"Auto-rescue (v06.5) triggered for {input_p.name}: "
+                f"{len(_target_pages)} page(s) → {_target_pages[:5]}"
+                f"{'…' if len(_target_pages) > 5 else ''}"
+            )
+            try:
+                _rescue_result = run_vision_on_pages(
+                    str(input_p), _target_pages, provider,
+                    prompt=get_vision_prompt_for_family(
+                        evidence.family.value if evidence.family else "default"
+                    ),
+                )
+                _pages_ok = _rescue_result.get("pages_succeeded", []) or []
+                _page_texts = _rescue_result.get("page_texts", {}) or {}
+                _page_conf = _rescue_result.get("page_confidence", {}) or {}
+
+                if _pages_ok:
+                    # Record vision was applied.
+                    evidence.vision_applied = True
+                    evidence.vision_mode_used = "auto_rescue_fixable_warnings"
+                    evidence.vision_pages_used = _pages_ok
+                    evidence.vision_trigger_reason = "auto_rescue_v065"
+                    evidence.vision_page_texts.update(_page_texts)
+                    if _page_conf:
+                        evidence.vision_confidence_pages.update(_page_conf)
+                    engine_chain.append("vision_auto_rescue_v065")
+
+                    # Decide: clear vs downgrade based on page confidence.
+                    # Threshold: average page confidence ≥ 0.70 clears flags;
+                    # below that, flags are downgraded to info severity so
+                    # reviewers still see the signal but readiness isn't
+                    # artificially blocked.
+                    _confs = [c for c in _page_conf.values() if isinstance(c, (int, float))]
+                    _avg_conf = sum(_confs) / len(_confs) if _confs else 0.0
+                    _strong_rescue = (
+                        len(_pages_ok) >= len(_target_pages) * 0.75
+                        and _avg_conf >= 0.70
+                    )
+
+                    if _strong_rescue:
+                        # Clear the fixable flags entirely.
+                        evidence.flags = [
+                            f for f in evidence.flags
+                            if f.type not in VISION_FIXABLE_FLAGS
+                        ]
+                        # Log the rescue as an info flag so provenance is preserved.
+                        evidence.flags.append(Flag(
+                            type="rescue_applied",
+                            description=(
+                                f"Auto-rescue vision ran successfully on "
+                                f"{len(_pages_ok)} page(s). OCR/handwriting "
+                                f"warnings cleared (avg page confidence "
+                                f"{_avg_conf:.2f})."
+                            ),
+                            severity="info",
+                        ))
+                    else:
+                        # Downgrade fixable warnings to info severity so the
+                        # reviewer still sees the context but readiness is
+                        # not artificially stuck. Keep the flag types so the
+                        # UI can still show provenance; drop severity so
+                        # readiness promotion can proceed.
+                        for _f in evidence.flags:
+                            if _f.type in VISION_FIXABLE_FLAGS:
+                                _f.severity = "info"
+                                _f.description = (
+                                    f"{_f.description} "
+                                    f"[Auto-rescue ran; vision confidence "
+                                    f"{_avg_conf:.2f} — review recommended.]"
+                                )
+                        evidence.flags.append(Flag(
+                            type="rescue_applied",
+                            description=(
+                                f"Auto-rescue vision ran on {len(_pages_ok)} "
+                                f"page(s) but confidence stayed low "
+                                f"({_avg_conf:.2f}). Original warnings "
+                                f"downgraded; reviewer confirmation suggested."
+                            ),
+                            severity="info",
+                        ))
+            except Exception as _rescue_err:
+                logger.warning(
+                    f"Auto-rescue vision failed for {input_p.name}: {_rescue_err}"
+                )
+                # On rescue failure, keep the original flags — user can still
+                # trigger manual vision from the UI.
+
     # Re-run readiness now that the new flags are present
     apply_readiness(evidence)
 
@@ -434,9 +565,198 @@ def ingest_one(
 
     status = "success" if score >= 0.70 else ("partial" if score >= 0.30 else "failed")
 
+    def _apply_vision_result(_vision_result: dict, _vision_mode: str) -> None:
+        """Merge vision result, rerun canonical when material, and store diagnostics."""
+        nonlocal evidence, status, parsed_doc, engine_chain
+        if not _vision_result or not evidence:
+            return
+
+        _pts = _vision_result.get("page_texts", {}) or {}
+        _sep = "\n\n"
+        _page_strs = [f"[Page {pn}]\n{t}" for pn, t in sorted(_pts.items())]
+        _vision_combined = _sep.join(_page_strs) if _pts else _vision_result.get("combined_text", "")
+
+        _vision_enhanced = False
+        _pages_replaced = []
+        _pages_appended = []
+        _high_risk_changes = []
+        _delta_pages = {}
+
+        if not evidence.original_raw_text:
+            evidence.original_raw_text = evidence.raw_text
+
+        if _pts and parsed_doc:
+            _seg_data = (evidence.document_specific or {}).get("_segmentation") or {}
+            _primary_pages = set(_seg_data.get("primary_pages") or [])
+
+            for _pn, _vtext in _pts.items():
+                _pidx = _pn - 1
+                if _pidx >= len(parsed_doc.pages):
+                    continue
+                _page = parsed_doc.pages[_pidx]
+                _native = _page.native_text or _page.text or ""
+
+                if _primary_pages and _pn not in _primary_pages:
+                    continue
+
+                _imp_score, _decision, _reason = _compute_page_improvement_score(_native, _vtext)
+                _has_hw, _hw_text, _hw_conf = _extract_handwriting_from_vision(_vtext)
+                _hr_changes = _detect_high_risk_field_changes(_native, _vtext, _pn)
+
+                from .extractor import _score_text
+                _ns = _score_text(_native)
+                _vs = _score_text(_vtext)
+                _delta_pages[_pn] = {
+                    "merge_decision": _decision,
+                    "merge_reason": _reason,
+                    "improvement_score": _imp_score,
+                    "native_chars": _ns["chars"],
+                    "vision_chars": _vs["chars"],
+                    "added_numbers": max(0, _vs["numbers"] - _ns["numbers"]),
+                    "added_dates": max(0, _vs["dates"] - _ns["dates"]),
+                    "added_amounts": max(0, _vs["currencies"] - _ns["currencies"]),
+                    "has_handwriting": _has_hw,
+                    "handwriting_text": _hw_text[:200] if _hw_text else "",
+                }
+
+                if _decision in (MERGE_REPLACE, MERGE_APPEND):
+                    from .models import ParsedPage as _PP
+                    _final_text = _vtext if _decision == MERGE_REPLACE else (_native + "\n\n[Vision annotation]\n" + _vtext)
+                    _final_ext = "vision" if _decision == MERGE_REPLACE else "hybrid"
+                    parsed_doc.pages[_pidx] = _PP(
+                        page_number=_pn, text=_final_text, char_count=len(_final_text), extractor=_final_ext,
+                        confidence=0.88, image_used=True, native_text=_native, vision_text=_vtext,
+                        final_text_used=_final_text, final_extractor_used=_final_ext, merge_decision=_decision,
+                        merge_reason=_reason, improvement_score=_imp_score, has_handwriting=_has_hw,
+                        handwriting_text=_hw_text, handwriting_confidence=_hw_conf,
+                    )
+                    (_pages_replaced if _decision == MERGE_REPLACE else _pages_appended).append(_pn)
+                    _vision_enhanced = True
+                    _high_risk_changes.extend(_hr_changes)
+
+            if _vision_enhanced:
+                parsed_doc.full_text = "\n\n".join(
+                    f"[Page {pg.page_number}]\n{pg.text}"
+                    for pg in parsed_doc.pages if pg.text.strip()
+                )
+                parsed_doc.vision_pages = _pages_replaced + _pages_appended
+                logger.info(f"Vision merge: replaced={_pages_replaced} appended={_pages_appended}")
+
+                _canonical_before = {
+                    "amounts": len(evidence.amounts),
+                    "dates": len(evidence.dates),
+                    "parties": len(evidence.parties),
+                    "facts": len(evidence.facts),
+                    "confidence": evidence.extraction_meta.overall_confidence,
+                    "readiness": evidence.readiness.readiness_status if evidence.readiness else "unknown",
+                }
+
+                try:
+                    _enhanced_evidence = extract_canonical(parsed_doc, provider, mode=mode, bypass_cache=True)
+                    _enhanced_evidence.original_raw_text = evidence.original_raw_text
+                    _enhanced_evidence.raw_text = evidence.original_raw_text
+                    _enhanced_evidence.working_raw_text = parsed_doc.full_text
+                    evidence = _enhanced_evidence
+                    engine_chain.append("canonical_ai_vision_enhanced")
+                    logger.info(f"Re-ran canonical on vision-enhanced text: {input_p.name}")
+                except Exception as _ce:
+                    logger.warning(f"Canonical re-run after vision failed: {_ce}")
+                    evidence.document_specific = evidence.document_specific or {}
+                    evidence.document_specific["_vision_canonical_error"] = str(_ce)
+
+                _canonical_after = {
+                    "amounts": len(evidence.amounts),
+                    "dates": len(evidence.dates),
+                    "parties": len(evidence.parties),
+                    "facts": len(evidence.facts),
+                    "confidence": evidence.extraction_meta.overall_confidence,
+                    "readiness": evidence.readiness.readiness_status if evidence.readiness else "unknown",
+                }
+            else:
+                _canonical_before = {}
+                _canonical_after = {}
+
+            _v_succeeded = set(_vision_result.get("pages_succeeded", []))
+            _v_attempted = set(_vision_result.get("pages_attempted", []) or _v_succeeded)
+            _v_failed = set(_vision_result.get("pages_failed", []))
+            _v_coverage = len(_v_succeeded) / max(len(_v_attempted), 1)
+            _STALE_LEGIBILITY_FLAGS = {"incomplete_page_set", "partial_extraction", "partial_extraction_visibility", "truncated_content"}
+            if _v_coverage >= 0.80 and not _v_failed:
+                evidence.flags = [f for f in evidence.flags if f.type not in _STALE_LEGIBILITY_FLAGS]
+            elif _v_coverage >= 0.80:
+                evidence.flags = [f for f in evidence.flags if not (f.type in _STALE_LEGIBILITY_FLAGS and f.severity == "warning")]
+
+            evidence.vision_applied = True
+            evidence.vision_mode_used = _vision_mode
+            evidence.vision_pages_used = _vision_result.get("pages_succeeded", [])
+            evidence.vision_page_texts = _pts
+            evidence.vision_page_status = _vision_result.get("page_status", {})
+            evidence.vision_prompt = _vision_result.get("prompt_used")
+            evidence.vision_error = _vision_result.get("error")
+            evidence.vision_text = _vision_combined
+            evidence.vision_overlay_text = _vision_combined
+            evidence.working_raw_text = parsed_doc.full_text if _vision_enhanced else evidence.raw_text
+
+            if _high_risk_changes:
+                evidence.vision_changed_high_risk_fields = _high_risk_changes
+                evidence.reviewer_confirmation_required = True
+                evidence.ingestion_state = STATE_REVIEWER_NEEDED
+
+            evidence.vision_delta_report = {
+                "pages_changed": _pages_replaced + _pages_appended,
+                "pages_replaced": _pages_replaced,
+                "pages_appended": _pages_appended,
+                "page_level_changes": _delta_pages,
+                "high_risk_changes": _high_risk_changes,
+                "canonical_before": _canonical_before,
+                "canonical_after": _canonical_after,
+                "canonical_reran": _vision_enhanced,
+            }
+
+            evidence.vision_run_diagnostics = {
+                "document": input_p.name,
+                "mode": _vision_mode,
+                "trigger_reason": evidence.vision_trigger_reason,
+                "pages_requested": _vision_result.get("pages_attempted", []),
+                "pages_rendered": _vision_result.get("pages_rendered", []),
+                "pages_succeeded": _vision_result.get("pages_succeeded", []),
+                "pages_failed": _vision_result.get("pages_failed", []),
+                "is_partial": _vision_result.get("is_partial", False),
+                "chars_returned": _vision_result.get("chars_returned", 0),
+                "elapsed_seconds": _vision_result.get("elapsed_seconds", 0.0),
+                "truncation_suspected": _vision_result.get("truncation_suspected", False),
+                "retry_reasons": _vision_result.get("retry_reasons"),
+                "canonical_reran": _vision_enhanced,
+                "reviewer_confirmation_required": evidence.reviewer_confirmation_required,
+                "error": _vision_result.get("error"),
+            }
+
+            engine_chain.append(f"vision:{_vision_mode}")
+
+            if _vision_enhanced:
+                apply_readiness(evidence)
+                _new_score = _score(evidence)
+                evidence.extraction_meta.overall_confidence = _new_score
+                status = "success" if _new_score >= 0.70 else ("partial" if _new_score >= 0.30 else "failed")
+
+                _v_chars = _vision_result.get("chars_returned", 0)
+                _v_pages_ok = len(_vision_result.get("pages_succeeded", []))
+                _v_total = max(1, len(_vision_result.get("pages_attempted", [1])))
+                _v_ratio = _v_pages_ok / _v_total
+                evidence.vision_confidence_document = (
+                    "high" if _v_ratio >= 0.9 and _v_chars > 500 else
+                    "medium" if _v_ratio >= 0.6 else "low"
+                )
+                evidence.canonical_confidence_before = _canonical_before.get("confidence", 0)
+                evidence.canonical_confidence_after = _new_score
+                evidence.canonical_rerun_mode = "full_rerun"
+                evidence.merge_confidence = (
+                    "high" if len(_pages_replaced) > 0 and not _vision_result.get("is_partial") else
+                    "medium" if len(_pages_appended) > 0 else "low"
+                )
     # ── Auto vision trigger: missing required fields (Item 5) ───────────────
-    # If standard extraction passed but key fields are empty, auto-target those pages
-    if vision_mode == VISION_AUTO and provider is not None:
+    # Only certain document families should auto-vision for missing amounts/dates/ids.
+    if vision_mode == VISION_AUTO and provider is not None and _should_auto_vision_for_missing_fields(evidence):
         _auto_pages, _auto_reasons = identify_pages_needing_vision_for_missing_fields(
             evidence, parsed_doc
         )
@@ -451,15 +771,9 @@ def ingest_one(
                     evidence.family.value if evidence.family else "default"
                 ),
             )
-            if _auto_result.get("page_texts"):
+            if _auto_result.get("page_texts") and _auto_result.get("chars_returned", 0) > 0:
                 evidence.vision_trigger_reason = TRIGGER_MISSING_FIELDS
-                # Store vision text for operator visibility without triggering full rerun
-                evidence.vision_page_texts.update(_auto_result["page_texts"])
-                evidence.vision_applied    = True
-                evidence.vision_mode_used  = "auto_missing_fields"
-                evidence.vision_pages_used = _auto_result.get("pages_succeeded", [])
-                engine_chain.append("vision_auto_missing_fields")
-
+                _apply_vision_result(_auto_result, "auto_missing_fields")
     # ── Manual vision paths ───────────────────────────────────────────────────
     if vision_mode not in (VISION_AUTO, VISION_STANDARD_ONLY) and provider is not None:
         _vision_result = None
@@ -490,227 +804,7 @@ def ingest_one(
                 _vision_result["retry_reasons"] = {"all": "No weak pages — full document pass"}
 
         if _vision_result and evidence:
-            _pts = _vision_result.get("page_texts", {})
-            _sep = "\n\n"
-            _page_strs = [f"[Page {pn}]\n{t}" for pn, t in sorted(_pts.items())]
-            _vision_combined = _sep.join(_page_strs) if _pts else _vision_result.get("combined_text", "")
-
-            # ── Field-aware vision merge (Items 1, 2, 3, 4, 9, 22) ───────────
-            _vision_enhanced  = False
-            _pages_replaced   = []
-            _pages_appended   = []
-            _high_risk_changes= []
-            _delta_pages      = {}
-
-            # Preserve original raw_text before mutation
-            if not evidence.original_raw_text:
-                evidence.original_raw_text = evidence.raw_text
-
-            if _pts and parsed_doc:
-                # Respect segmentation primary-doc scope (Item 4)
-                _seg_data = (evidence.document_specific or {}).get("_segmentation") or {}
-                _primary_pages = set(_seg_data.get("primary_pages") or [])
-
-                for _pn, _vtext in _pts.items():
-                    _pidx = _pn - 1
-                    if _pidx >= len(parsed_doc.pages):
-                        continue
-                    _page   = parsed_doc.pages[_pidx]
-                    _native = _page.native_text or _page.text or ""
-
-                    # Skip attachment pages when segmentation identified a primary scope
-                    if _primary_pages and _pn not in _primary_pages:
-                        continue
-
-                    _imp_score, _decision, _reason = _compute_page_improvement_score(_native, _vtext)
-                    _has_hw, _hw_text, _hw_conf    = _extract_handwriting_from_vision(_vtext)
-                    _hr_changes                    = _detect_high_risk_field_changes(_native, _vtext, _pn)
-
-                    from .extractor import _score_text
-                    _ns = _score_text(_native)
-                    _vs = _score_text(_vtext)
-                    _delta_pages[_pn] = {
-                        "merge_decision":    _decision,
-                        "merge_reason":      _reason,
-                        "improvement_score": _imp_score,
-                        "native_chars":      _ns["chars"],
-                        "vision_chars":      _vs["chars"],
-                        "added_numbers":     max(0, _vs["numbers"]   - _ns["numbers"]),
-                        "added_dates":       max(0, _vs["dates"]     - _ns["dates"]),
-                        "added_amounts":     max(0, _vs["currencies"] - _ns["currencies"]),
-                        "has_handwriting":   _has_hw,
-                        "handwriting_text":  _hw_text[:200] if _hw_text else "",
-                    }
-
-                    if _decision in (MERGE_REPLACE, MERGE_APPEND):
-                        from .models import ParsedPage as _PP
-                        _final_text = _vtext if _decision == MERGE_REPLACE else (
-                            _native + "\n\n[Vision annotation]\n" + _vtext
-                        )
-                        _final_ext = "vision" if _decision == MERGE_REPLACE else "hybrid"
-                        parsed_doc.pages[_pidx] = _PP(
-                            page_number=_pn,
-                            text=_final_text,
-                            char_count=len(_final_text),
-                            extractor=_final_ext,
-                            confidence=0.88,
-                            image_used=True,
-                            native_text=_native,
-                            vision_text=_vtext,
-                            final_text_used=_final_text,
-                            final_extractor_used=_final_ext,
-                            merge_decision=_decision,
-                            merge_reason=_reason,
-                            improvement_score=_imp_score,
-                            has_handwriting=_has_hw,
-                            handwriting_text=_hw_text,
-                            handwriting_confidence=_hw_conf,
-                        )
-                        (_pages_replaced if _decision == MERGE_REPLACE else _pages_appended).append(_pn)
-                        _vision_enhanced = True
-                        _high_risk_changes.extend(_hr_changes)
-
-                if _vision_enhanced:
-                    parsed_doc.full_text = "\n\n".join(
-                        f"[Page {pg.page_number}]\n{pg.text}"
-                        for pg in parsed_doc.pages if pg.text.strip()
-                    )
-                    parsed_doc.vision_pages = _pages_replaced + _pages_appended
-                    logger.info(f"Vision merge: replaced={_pages_replaced} appended={_pages_appended}")
-
-                    _canonical_before = {
-                        "amounts":    len(evidence.amounts),
-                        "dates":      len(evidence.dates),
-                        "parties":    len(evidence.parties),
-                        "facts":      len(evidence.facts),
-                        "confidence": evidence.extraction_meta.overall_confidence,
-                        "readiness":  evidence.readiness.readiness_status if evidence.readiness else "unknown",
-                    }
-
-                    try:
-                        _enhanced_evidence = extract_canonical(
-                            parsed_doc, provider, mode=mode, bypass_cache=True
-                        )
-                        _enhanced_evidence.original_raw_text = evidence.original_raw_text
-                        _enhanced_evidence.raw_text           = evidence.original_raw_text
-                        _enhanced_evidence.working_raw_text   = parsed_doc.full_text
-                        evidence = _enhanced_evidence
-                        engine_chain.append("canonical_ai_vision_enhanced")
-                        logger.info(f"Re-ran canonical on vision-enhanced text: {input_p.name}")
-                    except Exception as _ce:
-                        logger.warning(f"Canonical re-run after vision failed: {_ce}")
-                        evidence.document_specific = evidence.document_specific or {}
-                        evidence.document_specific["_vision_canonical_error"] = str(_ce)
-
-            # Fix: suppress pre-vision legibility flags that are stale after a
-            # successful vision pass.  The canonical AI emits incomplete_page_set
-            # and friends before vision runs; if vision came back clean those
-            # flags are no longer accurate and should not alarm reviewers.
-            _v_succeeded = set(_vision_result.get("pages_succeeded", []))
-            _v_attempted = set(_vision_result.get("pages_attempted", []) or _v_succeeded)
-            _v_failed    = set(_vision_result.get("pages_failed", []))
-            _v_coverage  = len(_v_succeeded) / max(len(_v_attempted), 1)
-            _STALE_LEGIBILITY_FLAGS = {
-                "incomplete_page_set",
-                "partial_extraction",
-                "partial_extraction_visibility",
-                "truncated_content",
-            }
-            if _v_coverage >= 0.80 and not _v_failed:
-                # Full (or near-full) success — drop all stale legibility flags
-                evidence.flags = [
-                    f for f in evidence.flags
-                    if f.type not in _STALE_LEGIBILITY_FLAGS
-                ]
-            elif _v_coverage >= 0.80:
-                # Partial success — only drop warning-level stale flags
-                evidence.flags = [
-                    f for f in evidence.flags
-                    if not (f.type in _STALE_LEGIBILITY_FLAGS and f.severity == "warning")
-                ]
-
-            # Store all vision outputs and provenance (Items 2, 3, 10, 16, 22)
-            evidence.vision_applied        = True
-            evidence.vision_mode_used      = vision_mode
-            evidence.vision_pages_used     = _vision_result.get("pages_succeeded", [])
-            evidence.vision_page_texts     = _pts
-            evidence.vision_page_status    = _vision_result.get("page_status", {})
-            evidence.vision_prompt         = _vision_result.get("prompt_used")
-            evidence.vision_error          = _vision_result.get("error")
-            evidence.vision_text           = _vision_combined
-            evidence.vision_overlay_text   = _vision_combined
-            evidence.working_raw_text      = parsed_doc.full_text if _vision_enhanced else evidence.raw_text
-
-            # High-risk field changes requiring reviewer confirmation (Item 22)
-            if _high_risk_changes:
-                evidence.vision_changed_high_risk_fields = _high_risk_changes
-                evidence.reviewer_confirmation_required  = True
-                evidence.ingestion_state = STATE_REVIEWER_NEEDED
-
-            # Delta report: before/after vision (Item 3)
-            _canonical_after = {
-                "amounts":    len(evidence.amounts),
-                "dates":      len(evidence.dates),
-                "parties":    len(evidence.parties),
-                "facts":      len(evidence.facts),
-                "confidence": evidence.extraction_meta.overall_confidence,
-                "readiness":  evidence.readiness.readiness_status if evidence.readiness else "unknown",
-            } if _vision_enhanced else {}
-
-            evidence.vision_delta_report = {
-                "pages_changed":      _pages_replaced + _pages_appended,
-                "pages_replaced":     _pages_replaced,
-                "pages_appended":     _pages_appended,
-                "page_level_changes": _delta_pages,
-                "high_risk_changes":  _high_risk_changes,
-                "canonical_before":   _canonical_before if _vision_enhanced else {},
-                "canonical_after":    _canonical_after,
-                "canonical_reran":    _vision_enhanced,
-            }
-
-            evidence.vision_run_diagnostics = {
-                "document":              input_p.name,
-                "mode":                  vision_mode,
-                "trigger_reason":        evidence.vision_trigger_reason,
-                "pages_requested":       _vision_result.get("pages_attempted", []),
-                "pages_rendered":        _vision_result.get("pages_rendered", []),
-                "pages_succeeded":       _vision_result.get("pages_succeeded", []),
-                "pages_failed":          _vision_result.get("pages_failed", []),
-                "is_partial":            _vision_result.get("is_partial", False),
-                "chars_returned":        _vision_result.get("chars_returned", 0),
-                "elapsed_seconds":       _vision_result.get("elapsed_seconds", 0.0),
-                "truncation_suspected":  _vision_result.get("truncation_suspected", False),
-                "retry_reasons":         _vision_result.get("retry_reasons"),
-                "canonical_reran":       _vision_enhanced,
-                "reviewer_confirmation_required": evidence.reviewer_confirmation_required,
-                "error":                 _vision_result.get("error"),
-            }
-
-            engine_chain.append(f"vision_manual:{vision_mode}")
-
-            # Re-score and re-assess readiness after canonical re-run
-            if _vision_enhanced:
-                apply_readiness(evidence)
-                _new_score = _score(evidence)
-                evidence.extraction_meta.overall_confidence = _new_score
-                status = "success" if _new_score >= 0.70 else ("partial" if _new_score >= 0.30 else "failed")
-
-                # Vision confidence banding (Item 14)
-                _v_chars = _vision_result.get("chars_returned", 0)
-                _v_pages_ok = len(_vision_result.get("pages_succeeded", []))
-                _v_total = max(1, len(_vision_result.get("pages_attempted", [1])))
-                _v_ratio = _v_pages_ok / _v_total
-                evidence.vision_confidence_document = (
-                    "high" if _v_ratio >= 0.9 and _v_chars > 500 else
-                    "medium" if _v_ratio >= 0.6 else "low"
-                )
-                evidence.canonical_confidence_before = _canonical_before.get("confidence", 0)
-                evidence.canonical_confidence_after  = _new_score
-                evidence.canonical_rerun_mode        = "full_rerun"
-                evidence.merge_confidence = (
-                    "high" if len(_pages_replaced) > 0 and not _vision_result.get("is_partial") else
-                    "medium" if len(_pages_appended) > 0 else "low"
-                )
+            _apply_vision_result(_vision_result, vision_mode)
 
     return IngestionResult(
         evidence=evidence,

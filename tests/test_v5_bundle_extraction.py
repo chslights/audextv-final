@@ -340,7 +340,7 @@ def test_build_version():
     from pathlib import Path
     app_path = Path(__file__).parent.parent / "ingest_app.py"
     src = app_path.read_text()
-    assert 'BUILD_VERSION = "v05.1"' in src
+    assert 'BUILD_VERSION = "v06.5"' in src
 
 def test_canonical_schema_version():
     from audit_ingestion.canonical import SCHEMA_VERSION
@@ -352,4 +352,4 @@ def test_segmentation_schema_version():
 
 def test_package_version():
     import audit_ingestion
-    assert audit_ingestion.__version__ == "5.0.0"
+    assert audit_ingestion.__version__ == "6.5.0"

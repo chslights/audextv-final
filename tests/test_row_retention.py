@@ -311,7 +311,7 @@ def test_diagnostic_csv_has_readiness_and_row_fields():
 def test_build_version_bumped():
     ingest_app_path = Path(__file__).parent.parent / "ingest_app.py"
     src = ingest_app_path.read_text()
-    assert 'BUILD_VERSION = "v05.1"' in src
+    assert 'BUILD_VERSION = "v06.5"' in src
 
 
 def test_flag_deduplication_in_router():
