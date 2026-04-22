@@ -32,11 +32,11 @@ from audit_ingestion.workflow import (
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-BUILD_VERSION = "v06.5"
-DISPLAY_BUILD_VERSION = "V.06.5 Vision"
+BUILD_VERSION = "v06.2"
+DISPLAY_BUILD_VERSION = "V.06.2 Vision"
 
 st.set_page_config(
-    page_title="Audit Ingestion v06.5",
+    page_title="Audit Ingestion v06",
     page_icon="📋",
     layout="wide",
 )
@@ -269,10 +269,18 @@ def _hydrate_ui_evidence(ev):
                     if ev.readiness.readiness_status == "ready":
                         ev.readiness.readiness_status = "exception_open"
                     break
-    # v06.5: delegate the Ready-vs-warning reconciliation to readiness module
-    # so the logic is unit-testable without importing the Streamlit app.
-    from audit_ingestion.readiness import reconcile_readiness_with_warnings
-    reconcile_readiness_with_warnings(ev)
+    # Hard consistency rule: a file cannot remain Exception Open with zero open questions.
+    if ev.readiness:
+        _open_qs = [q for q in (ev.readiness.questions or []) if not q.resolved]
+        _wf = (ev.document_specific or {}).get("_workflow", {}) or {}
+        if ev.readiness.readiness_status == "exception_open" and not _open_qs:
+            ev.readiness.readiness_status = "ready"
+            ev.readiness.blocking_state = "non_blocking"
+            ev.readiness.blocking_issues = []
+            # Remove any stale active flags already captured as resolved exceptions.
+            _resolved_keys = {item.get("source_flag") for item in (_wf.get("resolved_exceptions") or []) if item.get("source_flag")}
+            if _resolved_keys:
+                ev.flags = [f for f in (ev.flags or []) if getattr(f, "type", None) not in _resolved_keys]
     return ev
 
 
@@ -597,7 +605,7 @@ with st.sidebar:
 4. **Audit evidence object**
    Facts + Claims + Flags + Link Keys
     """)
-    st.caption("Audit Ingestion Pipeline v06.5")
+    st.caption("Audit Ingestion Pipeline v05")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -697,65 +705,6 @@ def _update_evidence_in_session(source_file: str, updater):
         ev = _hydrate_ui_evidence(ev)
         persist_evidence_state(ev)
         st.session_state["v05_results"][idx]["evidence"] = ev.model_dump()
-
-
-def _run_vision_for_file(source_file: str, mode: str = VISION_RETRY) -> tuple[bool, str]:
-    """
-    v06.5: Per-file vision rerun launchable from any summary-row warning.
-
-    Runs vision against the stored bytes for `source_file` and replaces the
-    full evidence object on success (same apply-pattern as _run_manual_vision,
-    but addressable by filename rather than the currently-selected document).
-
-    Returns (ok, message). The caller decides how to render the message.
-    """
-    _api_key_v = st.session_state.get("api_key_input", "")
-    if not _api_key_v:
-        return False, "API key required for vision extraction."
-
-    _fbytes = st.session_state.get(f"_upload_bytes_{source_file}", b"")
-    if not _fbytes:
-        return False, f"File bytes not found for {source_file}. Re-upload and try again."
-
-    from audit_ingestion.router import ingest_one
-    from audit_ingestion.models import AuditEvidence
-    import tempfile, os as _os2
-
-    _suffix = Path(source_file).suffix or ".pdf"
-    with tempfile.NamedTemporaryFile(suffix=_suffix, delete=False, prefix="vision_warn_") as _tmp:
-        _tmp.write(_fbytes)
-        _tp = _tmp.name
-    try:
-        _vres = ingest_one(
-            _tp,
-            api_key=_api_key_v,
-            mode="fast",
-            bypass_cache=True,
-            vision_mode=mode,
-        )
-        if not _vres.evidence:
-            return False, "Vision run returned no evidence."
-
-        def _apply_vision(_ev):
-            _new = _vres.evidence
-            _new.source_file = _ev.source_file
-            for _field in _new.model_fields:
-                try:
-                    setattr(_ev, _field, getattr(_new, _field))
-                except Exception:
-                    pass
-
-        _update_evidence_in_session(source_file, _apply_vision)
-        _pages = _vres.evidence.vision_pages_used or []
-        return True, (
-            f"Vision complete on {source_file}. Pages processed: "
-            f"{_pages or 'none'}"
-        )
-    except Exception as _ve:
-        return False, f"Vision extraction failed: {_ve}"
-    finally:
-        try: _os2.unlink(_tp)
-        except: pass
 
 
 def _question_detail(ev, q):
@@ -961,75 +910,20 @@ for row in summary_rows:
     _wf = row.get("_warn_flags") or []
     with _rc[8]:
         if _wf:
-            # v06.5: classify warnings by whether vision can fix them. The
-            # UI surfaces the most-useful action per warning class rather
-            # than routing everything through a generic question form.
-            from audit_ingestion.readiness import VISION_FIXABLE_FLAGS
-            _fixable_here = [f for f in _wf if getattr(f, "type", "") in VISION_FIXABLE_FLAGS]
-            _judgment_here = [f for f in _wf if getattr(f, "type", "") not in VISION_FIXABLE_FLAGS]
-
             _warn_label = f"⚠️ {len(_wf)} warning{'s' if len(_wf) > 1 else ''}"
             with st.expander(_warn_label, expanded=False):
-                # Render each warning description.
                 for _wflag in _wf:
                     _wtype = getattr(_wflag, "type", "")
                     _wdesc = getattr(_wflag, "description", "")
-                    _wfixable = _wtype in VISION_FIXABLE_FLAGS
-                    _label_color = "#b45309" if _wfixable else "#92400e"
-                    _tag = " · vision-fixable" if _wfixable else ""
                     st.markdown(
-                        f"<small><b style='color:{_label_color}'>"
-                        f"{_wtype.replace('_',' ').title()}{_tag}</b><br>{_wdesc}</small>",
+                        f"<small><b>{_wtype.replace('_',' ').title()}</b><br>{_wdesc}</small>",
                         unsafe_allow_html=True,
                     )
                     st.divider()
-
-                # Action row — tailored to the warning types present.
-                _action_cols = st.columns(2)
-                _has_key = bool(st.session_state.get("api_key_input", ""))
-
-                # Vision action: shown when any fixable warning is present.
-                # Disabled with a helpful caption when no API key is set.
-                if _fixable_here:
-                    with _action_cols[0]:
-                        if st.button(
-                            "🔎 Run Vision",
-                            key=f"warn_vision_{fname}",
-                            use_container_width=True,
-                            disabled=not _has_key,
-                            help=(
-                                "Run vision extraction on the weak/handwriting pages. "
-                                "If vision succeeds, OCR warnings will be cleared or "
-                                "downgraded automatically."
-                            ),
-                        ):
-                            with st.spinner(f"Running vision on {fname}…"):
-                                _ok, _msg = _run_vision_for_file(fname, mode=VISION_RETRY)
-                            if _ok:
-                                st.success(_msg)
-                                st.rerun()
-                            else:
-                                st.error(_msg)
-
-                # Open File: always useful for any warning.
-                with _action_cols[1]:
-                    if st.button(
-                        "📂 Open File",
-                        key=f"warn_open_{fname}",
-                        use_container_width=True,
-                        help="Open the full detail view for this file.",
-                    ):
-                        _focus_document(fname)
-                        st.rerun()
-
-                # Question flow: shown only for judgment-required warnings
-                # that have open questions. Fixable warnings deliberately
-                # don't route here — the Run Vision button above is the
-                # correct action.
                 _qc_w = row.get("q_count", 0)
-                if _judgment_here and _qc_w:
+                if _qc_w:
                     if st.button(
-                        f"💬 Answer {_qc_w} open question{'s' if _qc_w > 1 else ''}",
+                        f"Answer {_qc_w} open question{'s' if _qc_w > 1 else ''}",
                         key=f"warn_q_{fname}",
                         use_container_width=True,
                     ):
